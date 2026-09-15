@@ -1,1 +1,1029 @@
+Below is the full implementation plan for the VS Code agent you described. I have laid it out in the order you would actually build it: architecture decisions first, then the extension skeleton, then each workflow stage with its inputs, outputs, exact commands, failure paths, and code-level design, and finally testing, security, and delivery milestones.
 
+Note: this conversation runs without repository access, so this is a design and implementation plan rather than committed code. Everything below is written so it can be handed directly to whoever builds it (you, or an agent started from a repo-attached surface).
+
+---
+
+# 1. What we are building
+
+A VS Code extension that registers a Chat Participant (for example `@jira-dev`). When the user selects it in the Chat view and sends "hi", the participant drives a strict, resumable, multi-stage workflow:
+
+```
+hi
+ └─► Collect Jira details (key, description, acceptance criteria)
+     └─► Collect local repo path ─► switch workspace to that repo
+         └─► Collect git strategy (base branch, new branch, commit message)
+             └─► git fetch / checkout base / force pull / cut branch
+                 └─► Analyze whole codebase ─► produce implementation plan
+                     └─► WAIT for user approval of plan
+                         └─► Implement changes (agentic edit loop)
+                             └─► Clean build ─► fix-loop on compile failures
+                                 └─► Start app with dev profile ─► hit /actuator/health
+                                     └─► Commit + push with user's message
+                                         └─► WAIT: user deploys to dev, confirms
+                                             └─► WAIT: user starts test runner locally, gives URL
+                                                 └─► Collect kID/password, then clientId/secret
+                                                     └─► Open browser, fill logins, go to API, run regression
+                                                         └─► Download results
+                                                             └─► Generate report (.md or .docx) — ask which
+                                                                 └─► WAIT: user validates logs
+                                                                     └─► Close session, wipe secrets
+Any failure at any stage ──► capture failure context ──► ask user ──► redo from "Analyze & plan"
+```
+
+Three things fundamentally shape the design:
+
+1. **Long-lived, interruptible conversation.** The user is asked for input at ~10 distinct points and may take hours between steps (deploying to dev, starting a test runner). The workflow must be a persisted state machine, not a single long function.
+2. **Workspace switching reloads the extension host.** `vscode.openFolder` restarts the extension, killing in-memory state. The state machine must survive that and auto-resume.
+3. **Browser automation against an unknown test-runner UI.** The login/regression/download selectors cannot be hardcoded; they must be a configurable profile with a recording helper.
+
+---
+
+# 2. Architecture decisions
+
+## 2.1 Extension surface: Chat Participant API
+
+Use `vscode.chat.createChatParticipant('jira-dev.agent', handler)` contributed in `package.json`. Rationale versus alternatives:
+
+| Option | Why / why not |
+|---|---|
+| **Chat Participant (`@jira-dev`)** — chosen | Appears exactly as "select the agent and send hi". Full control over each turn, can render markdown, buttons, progress, file trees, and can call tools. Deterministic flow control. |
+| Copilot Agent Mode with custom `vscode.lm.registerTool` tools | The LLM decides ordering; you cannot guarantee "ask Jira first, then repo, then branch". Rejected as the primary surface, but the same tools can be registered so Agent Mode can also use them. |
+| Webview panel wizard | Best form UX for credentials, but the user explicitly asked for a chat-driven agent. Used only as a fallback for secret entry (see §6.3). |
+
+## 2.2 LLM access
+
+Primary: `vscode.lm.selectChatModels({ vendor: 'copilot', family: 'gpt-4o' })` (GitHub Copilot's Language Model API, no API key management, respects org policy).
+Secondary (setting `jiraDev.llm.provider`): direct HTTP to OpenAI / Azure OpenAI / Anthropic with key stored in `context.secrets`. Abstract behind an `LlmClient` interface so the planner and implementer are provider-agnostic.
+
+## 2.3 Workflow engine: explicit finite state machine
+
+A `WorkflowEngine` holds a `Session` object persisted to `context.globalState` (and mirrored to `<repo>/.jira-dev/session.json` once the repo is known). Each state has:
+
+- `onEnter(session, ctx)` – performs automated work or emits a prompt.
+- `onUserMessage(session, text, ctx)` – parses the reply, validates, and returns the next state.
+- `onFailure(session, err)` – records failure context and returns `FAILED_AWAIT_REDO`.
+
+Every stage is idempotent and re-runnable so "redo from planning" is a state transition, not special-case code.
+
+## 2.4 Process/tool execution
+
+- Git: `simple-git` (thin wrapper over the `git` binary; exposes raw commands for `reset --hard`).
+- Build/run: Node `child_process.spawn` with streamed stdout/stderr into a dedicated `OutputChannel` ("Jira Dev Agent") **and** a `vscode.Terminal` via a `Pseudoterminal` so the user sees live logs.
+- HTTP health checks: Node 18+ global `fetch`.
+- Browser: `playwright` (Chromium, headed mode so the user sees the tab). Installed lazily on first use via `npx playwright install chromium`.
+- Documents: Markdown written directly; `.docx` via the `docx` npm package.
+
+## 2.5 Repository layout of the extension
+
+```
+jira-dev-agent/
+├─ package.json
+├─ tsconfig.json
+├─ esbuild.js                         # bundle to dist/extension.js
+├─ src/
+│  ├─ extension.ts                    # activate(): register participant, commands, resume session
+│  ├─ chat/
+│  │  ├─ participant.ts               # ChatRequestHandler → WorkflowEngine
+│  │  ├─ render.ts                    # markdown/buttons/progress helpers
+│  │  └─ intents.ts                   # parse "approve", "reject", "yes", "done", URLs, etc.
+│  ├─ workflow/
+│  │  ├─ engine.ts                    # FSM runner, persistence, resume
+│  │  ├─ session.ts                   # Session type + zod schema
+│  │  ├─ states.ts                    # enum of states + transition table
+│  │  └─ stages/
+│  │     ├─ collectJira.ts
+│  │     ├─ selectRepo.ts
+│  │     ├─ collectGitStrategy.ts
+│  │     ├─ gitPrepare.ts
+│  │     ├─ analyzeAndPlan.ts
+│  │     ├─ awaitPlanApproval.ts
+│  │     ├─ implement.ts
+│  │     ├─ build.ts
+│  │     ├─ runAndHealthCheck.ts
+│  │     ├─ commitAndPush.ts
+│  │     ├─ awaitDevDeploy.ts
+│  │     ├─ awaitTestRunnerUrl.ts
+│  │     ├─ collectCredentials.ts
+│  │     ├─ browserRegression.ts
+│  │     ├─ downloadResults.ts
+│  │     ├─ document.ts
+│  │     ├─ awaitLogValidation.ts
+│  │     └─ failedAwaitRedo.ts
+│  ├─ services/
+│  │  ├─ git.ts                       # simple-git wrapper
+│  │  ├─ workspace.ts                 # switching folders, path validation
+│  │  ├─ llm.ts                       # LlmClient interface + Copilot/OpenAI impls
+│  │  ├─ codebase/
+│  │  │  ├─ indexer.ts                # file tree, language detection, ripgrep search
+│  │  │  ├─ contextBuilder.ts         # choose files within token budget
+│  │  │  └─ buildToolDetector.ts      # maven/gradle/npm detection
+│  │  ├─ tools/                       # agentic tools used during implementation
+│  │  │  ├─ readFile.ts
+│  │  │  ├─ writeFile.ts
+│  │  │  ├─ applyPatch.ts
+│  │  │  ├─ listDir.ts
+│  │  │  ├─ search.ts
+│  │  │  └─ runCommand.ts
+│  │  ├─ process.ts                   # spawn with log capture, kill trees
+│  │  ├─ health.ts                    # poll actuator
+│  │  ├─ browser/
+│  │  │  ├─ playwright.ts             # launch, login, run regression, download
+│  │  │  └─ profile.ts                # selector profile schema + loader
+│  │  ├─ report/
+│  │  │  ├─ markdown.ts
+│  │  │  └─ docx.ts
+│  │  └─ secrets.ts                   # context.secrets wrapper, scoped per session
+│  └─ util/
+│     ├─ logger.ts
+│     ├─ tokens.ts                    # rough token estimation
+│     └─ retry.ts
+├─ resources/
+│  ├─ prompts/                        # system prompts as .md, loaded at runtime
+│  │  ├─ planner.md
+│  │  ├─ implementer.md
+│  │  └─ buildFixer.md
+│  └─ testRunnerProfiles/
+│     └─ default.json                 # selector profile template
+├─ test/
+│  ├─ unit/                           # mocha; engine, intents, git (mocked), detector
+│  └─ integration/                    # @vscode/test-electron; fixture repo
+└─ README.md
+```
+
+---
+
+# 3. `package.json` contributions
+
+```json
+{
+  "name": "jira-dev-agent",
+  "displayName": "Jira Dev Agent",
+  "engines": { "vscode": "^1.93.0" },
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "extensionDependencies": ["github.copilot-chat"],
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "jira-dev.agent",
+        "name": "jira-dev",
+        "fullName": "Jira Dev Agent",
+        "description": "End-to-end Jira ticket implementation: plan, code, build, verify, push, test, document.",
+        "isSticky": true,
+        "commands": [
+          { "name": "start",   "description": "Start a new session" },
+          { "name": "status",  "description": "Show current stage and collected inputs" },
+          { "name": "resume",  "description": "Resume the persisted session" },
+          { "name": "approve", "description": "Approve the current plan" },
+          { "name": "reject",  "description": "Reject the plan and request changes" },
+          { "name": "redo",    "description": "Redo from planning" },
+          { "name": "abort",   "description": "Abort and clear the session" },
+          { "name": "logs",    "description": "Open the agent output channel" }
+        ]
+      }
+    ],
+    "commands": [
+      { "command": "jiraDev.approvePlan",   "title": "Jira Dev: Approve Plan" },
+      { "command": "jiraDev.rejectPlan",    "title": "Jira Dev: Reject Plan" },
+      { "command": "jiraDev.confirmStep",   "title": "Jira Dev: Confirm Step" },
+      { "command": "jiraDev.enterSecret",   "title": "Jira Dev: Enter Secret" },
+      { "command": "jiraDev.openLogs",      "title": "Jira Dev: Open Logs" },
+      { "command": "jiraDev.recordProfile", "title": "Jira Dev: Record Test Runner Profile" }
+    ],
+    "configuration": {
+      "title": "Jira Dev Agent",
+      "properties": {
+        "jiraDev.llm.provider":            { "type": "string", "enum": ["copilot", "openai", "azureOpenai", "anthropic"], "default": "copilot" },
+        "jiraDev.llm.model":               { "type": "string", "default": "gpt-4o" },
+        "jiraDev.git.allowDirtyTree":      { "type": "string", "enum": ["abort", "stash", "discard"], "default": "abort" },
+        "jiraDev.build.command":           { "type": "string", "default": "" , "description": "Override auto-detected clean build command" },
+        "jiraDev.run.command":             { "type": "string", "default": "" },
+        "jiraDev.run.profile":             { "type": "string", "default": "dev" },
+        "jiraDev.health.path":             { "type": "string", "default": "/actuator/health" },
+        "jiraDev.health.timeoutSeconds":   { "type": "number", "default": 180 },
+        "jiraDev.implement.maxIterations": { "type": "number", "default": 40 },
+        "jiraDev.build.maxFixAttempts":    { "type": "number", "default": 3 },
+        "jiraDev.testRunner.profile":      { "type": "string", "default": "default" },
+        "jiraDev.report.defaultFormat":    { "type": "string", "enum": ["ask", "md", "docx", "both"], "default": "ask" },
+        "jiraDev.resultsDir":              { "type": "string", "default": ".jira-dev/results" }
+      }
+    }
+  },
+  "dependencies": {
+    "simple-git": "^3.25.0",
+    "playwright": "^1.47.0",
+    "docx": "^8.5.0",
+    "zod": "^3.23.0",
+    "yaml": "^2.5.0",
+    "tree-kill": "^1.2.2"
+  }
+}
+```
+
+Chat-side buttons (`stream.button({ command, title, arguments })`) invoke the `jiraDev.*` commands; each command just forwards a synthetic message into the engine so buttons and typed replies converge on the same handler.
+
+---
+
+# 4. Session model and state machine
+
+## 4.1 Session schema (`src/workflow/session.ts`)
+
+```ts
+export const SessionSchema = z.object({
+  id: z.string(),                       // uuid
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  state: z.nativeEnum(State),
+  previousState: z.nativeEnum(State).optional(),
+  attempt: z.number().default(1),       // increments on each "redo from planning"
+
+  jira: z.object({
+    key: z.string(),                    // e.g. ABC-1234 (regex ^[A-Z][A-Z0-9]+-\d+$)
+    summary: z.string().optional(),
+    description: z.string(),
+    acceptanceCriteria: z.array(z.string()),
+  }).optional(),
+
+  repo: z.object({
+    path: z.string(),                   // absolute, validated git toplevel
+    remoteUrl: z.string().optional(),
+    buildTool: z.enum(['maven', 'gradle', 'npm', 'unknown']).optional(),
+    buildCommand: z.string().optional(),
+    runCommand: z.string().optional(),
+    port: z.number().optional(),
+  }).optional(),
+
+  git: z.object({
+    baseBranch: z.string(),
+    featureBranch: z.string(),
+    commitMessage: z.string(),
+    baseSha: z.string().optional(),
+    pushedSha: z.string().optional(),
+  }).optional(),
+
+  plan: z.object({
+    version: z.number(),
+    markdown: z.string(),
+    structured: PlanSchema,             // see §8.4
+    approvedAt: z.string().optional(),
+    feedbackHistory: z.array(z.string()),
+  }).optional(),
+
+  implementation: z.object({
+    filesChanged: z.array(z.string()),
+    iterations: z.number(),
+    summary: z.string(),
+  }).optional(),
+
+  build: z.object({
+    attempts: z.number(),
+    success: z.boolean(),
+    logPath: z.string(),
+    durationMs: z.number(),
+  }).optional(),
+
+  health: z.object({
+    url: z.string(),
+    status: z.string(),
+    responseBody: z.string(),
+    checkedAt: z.string(),
+  }).optional(),
+
+  deploy: z.object({ confirmedAt: z.string(), note: z.string().optional() }).optional(),
+
+  testRunner: z.object({
+    url: z.string(),
+    profileName: z.string(),
+    resultsPaths: z.array(z.string()),
+    summary: z.object({ total: z.number(), passed: z.number(), failed: z.number(), skipped: z.number() }).optional(),
+    userVerdict: z.enum(['pass', 'fail']).optional(),
+  }).optional(),
+
+  report: z.object({ format: z.enum(['md', 'docx', 'both']), paths: z.array(z.string()) }).optional(),
+
+  failures: z.array(z.object({
+    state: z.nativeEnum(State),
+    at: z.string(),
+    message: z.string(),
+    logExcerpt: z.string(),
+  })),
+
+  // Secrets are NEVER stored here; only the keys under which they live in context.secrets
+  secretKeys: z.object({
+    kid: z.string().optional(),
+    kidPassword: z.string().optional(),
+    clientId: z.string().optional(),
+    clientSecret: z.string().optional(),
+  }).default({}),
+});
+```
+
+## 4.2 States (`src/workflow/states.ts`)
+
+```ts
+export enum State {
+  IDLE = 'IDLE',
+  COLLECT_JIRA = 'COLLECT_JIRA',
+  SELECT_REPO = 'SELECT_REPO',
+  SWITCHING_WORKSPACE = 'SWITCHING_WORKSPACE',     // transient; survives window reload
+  COLLECT_GIT_STRATEGY = 'COLLECT_GIT_STRATEGY',
+  GIT_PREPARE = 'GIT_PREPARE',
+  ANALYZE_AND_PLAN = 'ANALYZE_AND_PLAN',
+  AWAIT_PLAN_APPROVAL = 'AWAIT_PLAN_APPROVAL',
+  IMPLEMENT = 'IMPLEMENT',
+  BUILD = 'BUILD',
+  RUN_AND_HEALTHCHECK = 'RUN_AND_HEALTHCHECK',
+  COMMIT_AND_PUSH = 'COMMIT_AND_PUSH',
+  AWAIT_DEV_DEPLOY = 'AWAIT_DEV_DEPLOY',
+  AWAIT_TEST_RUNNER_URL = 'AWAIT_TEST_RUNNER_URL',
+  COLLECT_LOGIN_CREDS = 'COLLECT_LOGIN_CREDS',
+  COLLECT_CLIENT_CREDS = 'COLLECT_CLIENT_CREDS',
+  BROWSER_REGRESSION = 'BROWSER_REGRESSION',
+  DOWNLOAD_RESULTS = 'DOWNLOAD_RESULTS',
+  AWAIT_TEST_VERDICT = 'AWAIT_TEST_VERDICT',
+  ASK_REPORT_FORMAT = 'ASK_REPORT_FORMAT',
+  DOCUMENT = 'DOCUMENT',
+  AWAIT_LOG_VALIDATION = 'AWAIT_LOG_VALIDATION',
+  CLOSED = 'CLOSED',
+  FAILED_AWAIT_REDO = 'FAILED_AWAIT_REDO',
+}
+```
+
+Classification:
+
+- **Input states** (wait for the user): `COLLECT_JIRA`, `SELECT_REPO`, `COLLECT_GIT_STRATEGY`, `AWAIT_PLAN_APPROVAL`, `AWAIT_DEV_DEPLOY`, `AWAIT_TEST_RUNNER_URL`, `COLLECT_LOGIN_CREDS`, `COLLECT_CLIENT_CREDS`, `AWAIT_TEST_VERDICT`, `ASK_REPORT_FORMAT`, `AWAIT_LOG_VALIDATION`, `FAILED_AWAIT_REDO`.
+- **Automated states** (run to completion, then auto-advance): `SWITCHING_WORKSPACE`, `GIT_PREPARE`, `ANALYZE_AND_PLAN`, `IMPLEMENT`, `BUILD`, `RUN_AND_HEALTHCHECK`, `COMMIT_AND_PUSH`, `BROWSER_REGRESSION`, `DOWNLOAD_RESULTS`, `DOCUMENT`.
+
+## 4.3 Engine loop (`src/workflow/engine.ts`)
+
+```ts
+export class WorkflowEngine {
+  constructor(private ctx: vscode.ExtensionContext, private deps: Deps) {}
+
+  async handleTurn(req: vscode.ChatRequest, stream: vscode.ChatResponseStream, token: vscode.CancellationToken) {
+    let session = await this.load();
+    if (!session || session.state === State.CLOSED) session = this.newSession();
+
+    const stage = stages[session.state];
+    // 1. Feed the user's message to the current stage
+    let next = await stage.onUserMessage(session, req.prompt, { stream, token, ...this.deps });
+    // 2. Drive automated states until we hit an input state or terminal state
+    while (next && isAutomated(next)) {
+      session.previousState = session.state;
+      session.state = next;
+      await this.save(session);
+      try {
+        next = await stages[next].onEnter(session, { stream, token, ...this.deps });
+      } catch (err) {
+        next = await this.recordFailure(session, err, stream);   // → FAILED_AWAIT_REDO
+      }
+    }
+    if (next) { session.state = next; await this.save(session); await stages[next].onEnter(session, ...); }
+  }
+}
+```
+
+Key rule: **every automated stage writes the session before and after** so a crash or window reload lands on a known state, and `/resume` re-enters it.
+
+## 4.4 Persistence and resume
+
+- `context.globalState.update('jiraDev.session', session)` on every save.
+- Once `repo.path` is known, also write `<repo>/.jira-dev/session.json` (and add `.jira-dev/` to `.git/info/exclude`, not `.gitignore`, so the repo is not modified).
+- On `activate()`: if a session exists with `state === SWITCHING_WORKSPACE` and `vscode.workspace.workspaceFolders[0].uri.fsPath === session.repo.path`, immediately post a notification "Jira Dev Agent: workspace switched, resuming…" with a button that opens Chat and pre-fills `@jira-dev /resume`. (Extensions cannot inject a chat message on their own; the notification + `workbench.action.chat.open` with `query: '@jira-dev /resume'` is the sanctioned path.)
+
+## 4.5 Intent parsing (`src/chat/intents.ts`)
+
+Small, deterministic parser applied before any LLM call, so approvals are never misinterpreted:
+
+| Intent | Matches (case-insensitive, trimmed) |
+|---|---|
+| `APPROVE` | `approve`, `approved`, `yes`, `y`, `ok`, `lgtm`, `go ahead`, `/approve` |
+| `REJECT` | `reject`, `no`, `n`, `changes:` prefix, `/reject` |
+| `DONE` | `done`, `deployed`, `completed`, `finished` |
+| `PASS` / `FAIL` | `pass`, `passed` / `fail`, `failed` |
+| `URL` | first `https?://\S+` |
+| `REDO` | `redo`, `/redo`, `restart planning` |
+| `ABORT` | `/abort`, `abort`, `cancel session` |
+| `FORMAT` | `md`, `markdown`, `word`, `docx`, `both` |
+| `FREE_TEXT` | fallback |
+
+Structured inputs (Jira details, git strategy) are parsed with a labelled-field parser first (`Key: ABC-123`, `Base branch: develop`), then fall back to an LLM extraction call with a JSON schema if the user writes prose.
+
+---
+
+# 5. Stage-by-stage implementation detail
+
+## 5.1 `IDLE` → `COLLECT_JIRA`
+
+Trigger: any first message ("hi", "hello", `/start`).
+
+Prompt rendered:
+
+```
+Hi. I'll take this Jira ticket end to end. First, the ticket details.
+
+Please send (you can paste all at once, one per line):
+  Jira key:              e.g. ABC-1234
+  Summary (optional):
+  Description:
+  Acceptance criteria:   one per line, or numbered
+```
+
+Parsing (`collectJira.ts`):
+
+1. Labelled-field parse. Regex for key `^[A-Z][A-Z0-9]+-\d+$`.
+2. If any required field missing → LLM extraction with schema `{ key, summary?, description, acceptanceCriteria: string[] }` using `response_format` JSON.
+3. If still missing → re-ask only for the missing fields (keep collected ones). Show a summary table and ask "Correct? (yes / or paste corrections)".
+4. On confirmation → `SELECT_REPO`.
+
+Optional enhancement (setting `jiraDev.jira.baseUrl` + API token in secrets): if the user sends only the key, fetch `GET /rest/api/3/issue/{key}` and pre-fill description/AC (Atlassian Document Format → plaintext). Ask the user to confirm the fetched text.
+
+## 5.2 `SELECT_REPO` → `SWITCHING_WORKSPACE`
+
+Prompt:
+
+```
+Which local repository should I work in?
+Send the absolute path (e.g. /Users/me/work/payments-service or C:\work\payments-service),
+or click "Browse…".
+```
+
+Button: `stream.button({ command: 'jiraDev.browseRepo', title: 'Browse…' })` → `vscode.window.showOpenDialog({ canSelectFolders: true })`.
+
+Validation (`workspace.ts`):
+
+1. `fs.stat(path)` is a directory.
+2. `git -C <path> rev-parse --show-toplevel` succeeds; normalize `repo.path` to the toplevel.
+3. `git remote get-url origin` (store; warn if none — push will fail later).
+4. Detect build tool (`buildToolDetector.ts`): `pom.xml` → maven (`./mvnw` if exists else `mvn`); `build.gradle(.kts)` → gradle (`./gradlew` else `gradle`); `package.json` → npm/pnpm/yarn by lockfile. Store `buildCommand`/`runCommand` defaults (overridable by settings):
+   - maven: build `mvn -B clean install -DskipTests=false`; run `mvn spring-boot:run -Dspring-boot.run.profiles=dev`
+   - gradle: build `./gradlew clean build`; run `./gradlew bootRun --args='--spring.profiles.active=dev'`
+   - npm: build `npm ci && npm run build`; run `npm run start:dev` if exists else `npm start`
+5. Detect port: parse `src/main/resources/application-dev.{yml,yaml,properties}` then `application.*` for `server.port`; default 8080. Also scan `management.server.port` and `management.endpoints.web.base-path`.
+
+Workspace switch logic:
+
+- If `repo.path` is already a workspace folder → skip switching, go to `COLLECT_GIT_STRATEGY`.
+- Else, if the current window has a workspace open: call `vscode.workspace.updateWorkspaceFolders(0, count, { uri })` to **replace** folders in-place. In a single-folder window this still triggers a reload; in a multi-root/untitled workspace it does not. So:
+  - Save session with `state = SWITCHING_WORKSPACE` first.
+  - Show `stream.markdown('Switching workspace to <path>. VS Code may reload; I will offer to resume.')`.
+  - Execute `vscode.commands.executeCommand('vscode.openFolder', uri, { forceNewWindow: false })`.
+- On reactivation the resume hook in §4.4 fires. `SWITCHING_WORKSPACE.onEnter` verifies the folder matches and advances to `COLLECT_GIT_STRATEGY`.
+
+## 5.3 `COLLECT_GIT_STRATEGY` → `GIT_PREPARE`
+
+Prompt (pre-filled with suggestions):
+
+```
+Git strategy. Current branches: main, develop, release/2026.09  (current: develop)
+
+  Base branch:      [suggest: develop]
+  New branch name:  [suggest: feature/ABC-1234-short-slug]
+  Commit message:   [suggest: ABC-1234: <summary>]
+
+Reply with the three values (or "use suggestions").
+```
+
+Suggestions come from `git branch -r` (prefer `develop` > `main` > `master`), Jira key + slugified summary, and a configurable template `jiraDev.git.commitTemplate` (`{key}: {summary}`).
+
+Validation:
+
+- Base branch exists on `origin` (`git ls-remote --heads origin <base>`). If not, list candidates and re-ask.
+- Feature branch name passes `git check-ref-format --branch <name>`. If it already exists locally or remotely, ask: reuse / choose another.
+- Commit message non-empty; enforce Jira key present (prepend if missing, tell the user).
+
+Confirm table → `GIT_PREPARE`.
+
+## 5.4 `GIT_PREPARE` (automated)
+
+Exact command sequence (`git.ts`), each logged to the output channel with exit code and duration:
+
+```bash
+git -C <repo> status --porcelain
+#   if non-empty:
+#     allowDirtyTree=abort   → stop, tell user to commit/stash; stay in COLLECT_GIT_STRATEGY
+#     allowDirtyTree=stash   → git stash push -u -m "jira-dev/<key>/<timestamp>"
+#     allowDirtyTree=discard → require explicit "yes, discard" reply, then git reset --hard && git clean -fd
+git -C <repo> fetch --all --prune --tags
+git -C <repo> pull --ff-only                       # "after switching to repo do a git pull" (on current branch; failure is non-fatal, logged)
+git -C <repo> checkout <base>                      # creates tracking branch if needed: checkout -b <base> origin/<base>
+git -C <repo> reset --hard origin/<base>           # the "force pull" — makes local base identical to remote
+git -C <repo> pull --ff-only origin <base>         # no-op sanity check
+git -C <repo> rev-parse HEAD                       # store git.baseSha
+git -C <repo> checkout -b <feature>                # or checkout <feature> && rebase onto base if reusing
+```
+
+Failure handling: any non-zero exit → `recordFailure` with the last 60 lines of git output → `FAILED_AWAIT_REDO`. Common cases surfaced with tailored messages: auth failure on fetch (suggest credential helper), branch not found, conflict on rebase when reusing branch.
+
+Success → `ANALYZE_AND_PLAN`.
+
+## 5.5 `ANALYZE_AND_PLAN` (automated) — "go through the entire code and prepare the plan"
+
+This is the most complex automated stage. It has four sub-steps with `stream.progress()` updates.
+
+### 5.5.1 Index the codebase (`indexer.ts`)
+
+- Walk the repo honoring `.gitignore` (use `git ls-files` plus `git ls-files --others --exclude-standard` for untracked); skip binaries, `target/`, `build/`, `node_modules/`, files > 400 KB.
+- For each file: path, size, language (by extension), line count. For Java/Kotlin: extract package, class names, annotations (`@RestController`, `@Service`, `@Repository`, `@Entity`, `@Configuration`) with a lightweight regex pass — enough for routing, no full parse.
+- Produce a **repo map**: a compact tree with per-file one-line summaries (class names, annotations, public method signatures for Java via regex `public\s+[\w<>\[\], ]+\s+(\w+)\s*\(`). Typical Spring service compresses to 5–15k tokens.
+- Cache index at `.jira-dev/index.json` keyed by `git rev-parse HEAD`.
+
+### 5.5.2 Select relevant files (`contextBuilder.ts`)
+
+1. Extract keywords from Jira description + AC (LLM call: "return 10–20 identifiers, domain nouns, endpoint paths, config keys").
+2. `rg -n -i --json <keyword>` across the repo for each keyword; score files by hits × keyword weight.
+3. Always include: build file(s), `application*.yml/properties`, main application class, any file with `@RestController` if the ticket mentions API/endpoint, DB migrations dir listing if ticket mentions schema.
+4. Fill a token budget (default 60k for the planner) with top-scored files, full content; add repo map for the rest.
+
+### 5.5.3 Generate the plan (`planner.md` prompt)
+
+System prompt contract (abbreviated):
+
+```
+You are a senior engineer planning a change in an existing codebase. You will receive:
+- Jira key, description, acceptance criteria
+- A repo map and the full content of relevant files
+Produce a plan as JSON matching the provided schema. Rules:
+- Reference only files that exist or that you explicitly mark as "create".
+- Each step must be concrete: file, what changes, why, how it maps to an acceptance criterion.
+- Include test changes (unit/integration) for every behavioural change.
+- Include config/migration/build changes if needed.
+- List assumptions and open questions separately. Do not invent requirements.
+- Estimate risk per step: low/medium/high with one-line justification.
+```
+
+`PlanSchema`:
+
+```ts
+const PlanSchema = z.object({
+  overview: z.string(),
+  assumptions: z.array(z.string()),
+  openQuestions: z.array(z.string()),
+  steps: z.array(z.object({
+    id: z.number(),
+    title: z.string(),
+    files: z.array(z.object({ path: z.string(), action: z.enum(['modify', 'create', 'delete']) })),
+    details: z.string(),
+    acceptanceCriteriaRefs: z.array(z.number()),
+    risk: z.enum(['low', 'medium', 'high']),
+    riskNote: z.string(),
+  })),
+  testing: z.array(z.string()),
+  rollback: z.string(),
+});
+```
+
+Post-validation: every `modify`/`delete` path must exist (check against index); otherwise re-prompt the model once with the list of invalid paths.
+
+If `attempt > 1` (redo after failure), the prompt also receives `session.failures` (last failure's stage, message, log excerpt) and the previous plan, with the instruction "revise the plan to address this failure".
+
+### 5.5.4 Render and hand off
+
+Render the plan as markdown in the chat: overview, table of steps (id / title / files / AC refs / risk), testing, assumptions, open questions. Save `.jira-dev/plan-v<N>.md`. Transition to `AWAIT_PLAN_APPROVAL`.
+
+## 5.6 `AWAIT_PLAN_APPROVAL` (input)
+
+Prompt with buttons:
+
+```
+Do you approve this plan?
+[Approve]  [Request changes]  [Open plan file]
+Or reply "approve", or "changes: <what to change>".
+```
+
+- `APPROVE` → set `plan.approvedAt` → `IMPLEMENT`.
+- `REJECT` / `changes: ...` → append feedback to `plan.feedbackHistory`, re-enter `ANALYZE_AND_PLAN` with feedback in the prompt, bump `plan.version`.
+- If the plan has `openQuestions`, the approval prompt shows them first and asks the user to answer; answers are appended to `jira.description` under "Clarifications" and the plan regenerated before approval is accepted (setting `jiraDev.plan.requireAnswers`, default true).
+
+## 5.7 `IMPLEMENT` (automated) — agentic edit loop
+
+Design: a bounded tool-calling loop (`implement.ts`) using the `implementer.md` prompt and the tools in `services/tools/`.
+
+Tools exposed to the model (JSON schema each):
+
+| Tool | Behaviour |
+|---|---|
+| `list_dir(path)` | Directory listing (respecting ignore rules) |
+| `read_file(path, startLine?, endLine?)` | Returns content with line numbers |
+| `search(pattern, glob?)` | ripgrep, max 200 hits |
+| `write_file(path, content)` | Create/overwrite; recorded in `filesChanged` |
+| `apply_patch(path, edits: [{oldText, newText}])` | Exact-match replacement; fails loudly if `oldText` not unique |
+| `run_command(cmd, timeoutSec)` | Whitelisted commands only: `mvn`, `./mvnw`, `gradle`, `./gradlew`, `npm`, `npx`, `git status/diff`; cwd = repo |
+| `mark_step_done(stepId, summary)` | Progress tracking |
+| `finish(summary)` | Ends the loop |
+
+Loop:
+
+```
+messages = [system(implementer.md), user(jira + approved plan JSON + repo map)]
+for i in 1..maxIterations:
+    resp = llm.chat(messages, tools)
+    if resp.toolCalls is empty and contains finish → break
+    for call in resp.toolCalls:
+        result = execute(call)         # every write goes through vscode.WorkspaceEdit so it's undoable
+        messages.push(toolResult(call.id, result))
+    stream.progress(`Step ${doneSteps}/${plan.steps.length} …`)
+    if token.isCancellationRequested → abort, leave working tree as-is, → FAILED_AWAIT_REDO
+if loop exhausted without finish → failure "implementation did not converge"
+```
+
+Guardrails:
+
+- Writes restricted to inside `repo.path`; refuse paths containing `..` or outside toplevel; refuse `.git/`.
+- After loop: `git diff --stat` and `git status --porcelain` are rendered in the chat as a collapsible file list (`stream.filetree`) with clickable diffs (`vscode.diff` against `HEAD`).
+- Store `implementation.filesChanged`, `iterations`, `summary`.
+- All steps in the plan must have `mark_step_done`; if not, one follow-up prompt "Steps X, Y not marked done — complete or explain", then proceed.
+
+→ `BUILD`.
+
+## 5.8 `BUILD` (automated) — "ensure that the clean build is successful"
+
+1. Command: `repo.buildCommand` (overridable). Run via `process.ts` with `spawn(shell=true, cwd=repo)`, env inherits user env plus `CI=true`, `MAVEN_OPTS`, `JAVA_HOME` from settings if provided.
+2. Stream stdout/stderr to the output channel and a pseudoterminal tab titled `Jira Dev: build`. Also tee to `.jira-dev/logs/build-<attempt>.log`.
+3. Timeout `jiraDev.build.timeoutSeconds` (default 1200). Kill process tree on timeout via `tree-kill`.
+4. Exit code 0 → record `build.success=true` → `RUN_AND_HEALTHCHECK`.
+5. Exit code ≠ 0 → **fix loop** (max `jiraDev.build.maxFixAttempts`, default 3):
+   - Extract errors: for maven, lines matching `\[ERROR\]` plus the `COMPILATION ERROR` block and surefire `Tests run:.*Failures: [1-9]` summaries plus `FAILED` test names; for gradle, `e: ` / `error:` lines and `> Task .* FAILED`; for npm, tsc/eslint errors.
+   - Call LLM with `buildFixer.md` prompt: errors + contents of referenced files → tool loop (same tools) limited to 10 iterations.
+   - Re-run build.
+6. Fix attempts exhausted → `FAILED_AWAIT_REDO` with the error excerpt.
+
+## 5.9 `RUN_AND_HEALTHCHECK` (automated) — "make application up and point to dev and test health/actuator endpoint"
+
+1. Start: `repo.runCommand` with env `SPRING_PROFILES_ACTIVE=dev` (also passed as arg for Spring; for npm `NODE_ENV=dev` / `APP_ENV=dev`). Spawned detached, PID tree tracked; stdout tee'd to `.jira-dev/logs/run.log` and a `Jira Dev: app` terminal.
+2. Readiness: poll `http://localhost:<port><healthPath>` every 3 s until `jiraDev.health.timeoutSeconds`. Accept 200 with JSON `status == "UP"`; if body isn't JSON, accept any 2xx. If `management.server.port` differs, use that. If `management.endpoints.web.base-path` is customized, respect it.
+3. Log scanning while waiting: if run.log matches `APPLICATION FAILED TO START`, `Port .* was already in use`, `BindException`, `Exception in thread "main"` → fail early with the excerpt. For port-in-use, offer the user "kill process on port and retry" (requires explicit yes).
+4. On success: store `health` (url, status, body, timestamp), render `✓ GET http://localhost:8080/actuator/health → 200 {"status":"UP"}` in chat.
+5. Always stop the app afterwards (`tree-kill(pid, 'SIGTERM')`, then SIGKILL after 10 s) unless setting `jiraDev.run.keepRunning=true`.
+6. Failure → `FAILED_AWAIT_REDO`.
+
+## 5.10 `COMMIT_AND_PUSH` (automated)
+
+```bash
+git -C <repo> add -A                              # respects .gitignore; .jira-dev excluded via .git/info/exclude
+git -C <repo> commit -m "<commitMessage>"         # if pre-commit hook fails → failure with hook output
+git -C <repo> push -u origin <feature>            # retry 4× with backoff 4/8/16/32 s on network errors only
+git -C <repo> rev-parse HEAD                      # git.pushedSha
+```
+
+Before committing, show `git diff --stat` and, if `jiraDev.git.confirmBeforePush` is true (default true), ask "Push N files to origin/<feature>? [Push] [Cancel]". The user asked for auto-push after success; the default confirmation is a safety valve they can switch off.
+
+If the remote returns a PR-creation URL in push output (`remote: Create a pull request…`), render it as a link.
+
+→ `AWAIT_DEV_DEPLOY`.
+
+## 5.11 `AWAIT_DEV_DEPLOY` (input)
+
+```
+Pushed <sha7> to origin/<feature>.
+Please deploy this branch to the dev environment. Reply "done" (optionally with a build/deploy URL or note) when it is up.
+[Deployed]
+```
+
+`DONE` → store `deploy.confirmedAt`, note → `AWAIT_TEST_RUNNER_URL`. Anything else → gentle re-ask; `FAIL`/"deploy failed" → `FAILED_AWAIT_REDO` with the user's note as the failure message.
+
+## 5.12 `AWAIT_TEST_RUNNER_URL` (input)
+
+```
+Please start the test runner application locally and send me its URL (e.g. http://localhost:3000).
+```
+
+Validation: parse URL; `fetch(url, { method: 'GET' })` with 5 s timeout; accept any HTTP response (even 401/302). If unreachable, say so and re-ask. Store `testRunner.url` → `COLLECT_LOGIN_CREDS`.
+
+## 5.13 `COLLECT_LOGIN_CREDS` and `COLLECT_CLIENT_CREDS` (input, secret-safe)
+
+Chat input is plain text and is logged by VS Code's chat history, so **passwords must not be typed into the chat**. Flow:
+
+```
+I need your kID and password for the test runner. Click the button below; the password is entered in a secure input box and stored encrypted in VS Code's SecretStorage for this session only.
+[Enter kID & password]
+```
+
+`jiraDev.enterSecret` command:
+
+- `showInputBox({ prompt: 'kID', ignoreFocusOut: true })`
+- `showInputBox({ prompt: 'Password for kID', password: true, ignoreFocusOut: true })`
+- `context.secrets.store('jiraDev.<sessionId>.kidPassword', value)`; store only the key name in `session.secretKeys`.
+- Then post a synthetic `DONE` message into the engine → `COLLECT_CLIENT_CREDS` with the same pattern for clientId / client secret.
+
+If the user does type a password into the chat anyway: detect (state is a credential state and message isn't an intent), store it, and reply "Stored. For safety, please clear that message from chat history." — never echo it.
+
+→ `BROWSER_REGRESSION`.
+
+## 5.14 `BROWSER_REGRESSION` (automated) — Playwright
+
+### 5.14.1 Test runner profile (`resources/testRunnerProfiles/default.json`)
+
+Because the test-runner UI is unknown, all selectors live in a profile:
+
+```json
+{
+  "name": "default",
+  "login": {
+    "path": "/login",
+    "userSelector": "input[name='username'], #kid",
+    "passwordSelector": "input[type='password']",
+    "submitSelector": "button[type='submit']",
+    "successSelector": "[data-testid='dashboard'], nav"
+  },
+  "clientAuth": {
+    "path": "/settings/client",
+    "clientIdSelector": "input[name='clientId']",
+    "clientSecretSelector": "input[name='clientSecret']",
+    "submitSelector": "button:has-text('Save'), button:has-text('Connect')",
+    "successSelector": "text=Connected"
+  },
+  "regression": {
+    "apiSectionPath": "/api",
+    "apiNavSelector": "a:has-text('API')",
+    "runButtonSelector": "button:has-text('Run Regression'), button:has-text('Run All')",
+    "runningIndicatorSelector": ".spinner, text=Running",
+    "completeSelector": "text=Completed, .status-complete",
+    "timeoutSeconds": 3600,
+    "summarySelectors": { "total": ".summary .total", "passed": ".summary .passed", "failed": ".summary .failed" }
+  },
+  "download": {
+    "buttonSelector": "button:has-text('Download'), a:has-text('Export')",
+    "expectedExtensions": [".xlsx", ".csv", ".json", ".html", ".zip"]
+  }
+}
+```
+
+Profiles are looked up in `<repo>/.jira-dev/profiles/<name>.json`, then user global storage, then the bundled default. The `jiraDev.recordProfile` command launches `npx playwright codegen <url>` and explains how to copy selectors into a profile; on first run against an unknown runner the agent asks the user to confirm the profile before proceeding.
+
+### 5.14.2 Automation sequence (`browser/playwright.ts`)
+
+```ts
+const browser = await chromium.launch({ headless: false, slowMo: 50 });
+const context = await browser.newContext({ acceptDownloads: true, viewport: { width: 1400, height: 900 } });
+const page = await context.newPage();
+
+// 1. Login (kID)
+await page.goto(url + profile.login.path);
+await page.fill(profile.login.userSelector, kid);
+await page.fill(profile.login.passwordSelector, kidPassword);
+await page.click(profile.login.submitSelector);
+await page.waitForSelector(profile.login.successSelector, { timeout: 60_000 });
+
+// 2. Client credentials
+if (profile.clientAuth.path) await page.goto(url + profile.clientAuth.path);
+await page.fill(profile.clientAuth.clientIdSelector, clientId);
+await page.fill(profile.clientAuth.clientSecretSelector, clientSecret);
+await page.click(profile.clientAuth.submitSelector);
+await page.waitForSelector(profile.clientAuth.successSelector, { timeout: 60_000 });
+
+// 3. Go to API section and run regression
+await page.goto(url + profile.regression.apiSectionPath)  /* or click apiNavSelector */;
+await page.click(profile.regression.runButtonSelector);
+await page.waitForSelector(profile.regression.completeSelector, { timeout: profile.regression.timeoutSeconds * 1000 });
+
+// 4. Read summary counts if selectors present
+```
+
+Between each step: `stream.progress('Logged in as <kid>…')`, and a screenshot saved to `.jira-dev/results/<key>/screenshots/<step>.png`. Secrets are pulled from `context.secrets` immediately before `fill` and never logged; the process-log redactor (§7) also masks them.
+
+Error handling: selector timeout → screenshot + page HTML snippet saved → ask the user in chat: "I could not find <element>. Options: [I'll do this step manually — continue], [Update profile], [Fail]". The browser stays open so the user can complete a step manually and reply "continue"; the automation resumes from the next step. This manual-fallback is what makes an unknown UI tractable.
+
+→ `DOWNLOAD_RESULTS`.
+
+## 5.15 `DOWNLOAD_RESULTS` (automated)
+
+```ts
+const [download] = await Promise.all([
+  page.waitForEvent('download', { timeout: 120_000 }),
+  page.click(profile.download.buttonSelector),
+]);
+const target = path.join(repo, resultsDir, jiraKey, `${timestamp}-${download.suggestedFilename()}`);
+await download.saveAs(target);
+```
+
+- If the result is `.zip`, extract alongside. If `.json`/`.csv`/`.xlsx`, attempt to parse a summary (`total/passed/failed/skipped`) with tolerant heuristics; otherwise use the on-page summary selectors; otherwise leave `summary` undefined.
+- Save a final full-page screenshot.
+- Close the browser unless failures are present (keep it open for inspection, tell the user).
+- Render: file paths (clickable), summary if known.
+
+→ `AWAIT_TEST_VERDICT`.
+
+## 5.16 `AWAIT_TEST_VERDICT` (input)
+
+```
+Regression complete: 148 total, 146 passed, 2 failed (from downloaded results).
+Did the regression pass for this change? [Pass] [Fail — redo from planning]
+```
+
+If summary shows `failed > 0`, default suggestion is Fail but the user decides (flaky tests exist). `PASS` → `ASK_REPORT_FORMAT`. `FAIL` → append failure with the failed test names → `FAILED_AWAIT_REDO`.
+
+## 5.17 `ASK_REPORT_FORMAT` → `DOCUMENT`
+
+"Document everything as Markdown, Word (.docx), or both? [Markdown] [Word] [Both]" (skipped if `jiraDev.report.defaultFormat` isn't `ask`).
+
+`DOCUMENT` generates `<repo>/docs/<KEY>-implementation-report.md` and/or `.docx` (and copies to `.jira-dev/results/<KEY>/`). Sections:
+
+1. Header: Jira key, summary, date, engineer (git `user.name`), session id, attempt count.
+2. Jira description and acceptance criteria (with per-AC ✓ mapping from plan steps).
+3. Repository and git: repo path, remote, base branch + `baseSha`, feature branch, commit message, `pushedSha`, PR link if any.
+4. Approved plan (final version) and plan revision history (feedback given).
+5. Implementation: files changed (`git diff --stat baseSha..pushedSha`), per-step summaries.
+6. Build: command, attempts, duration, result; link to log file; fix-loop summary if any.
+7. Runtime verification: run command, profile, health URL, response, timestamp.
+8. Deployment: user confirmation time and note.
+9. Regression: test runner URL (secrets omitted), profile used, start/end, summary counts, result file paths, screenshots embedded (docx) / linked (md).
+10. Failures and redo history (from `session.failures`).
+11. Appendix: full command log (redacted).
+
+Markdown via template literals; docx via `docx` package (`Document`, `Paragraph`, `Table`, `ImageRun`). Ask whether to commit the report to the branch (`[Commit & push report] [Leave uncommitted]`); if yes, `git add docs/… && git commit -m "<key>: add implementation report" && git push`.
+
+→ `AWAIT_LOG_VALIDATION`.
+
+## 5.18 `AWAIT_LOG_VALIDATION` → `CLOSED`
+
+```
+Report written: docs/ABC-1234-implementation-report.md
+Please validate the logs: [Open agent log] [Open build log] [Open app log] [Open results folder]
+Reply "validated" to close the session, or "issue: <text>" to record a problem.
+```
+
+- `validated`/`DONE` → `CLOSED`: delete all `jiraDev.<sessionId>.*` secrets, archive session JSON to `.jira-dev/sessions/<id>.json`, clear `globalState`, print final summary.
+- `issue:` → appended to failures; ask whether to redo from planning or close anyway.
+
+## 5.19 `FAILED_AWAIT_REDO` (input) — the universal failure handler
+
+Entered from any automated stage via `recordFailure`. Renders:
+
+```
+✗ Failed at <STAGE>: <message>
+Last log lines:
+  …
+Options: [Redo from planning] [Retry this step] [Abort session]
+```
+
+- `REDO` → `attempt++`, keep Jira/repo/git config, discard `plan.approvedAt`, → `ANALYZE_AND_PLAN` (with failure context; §5.5.3). Working tree is left as-is so the planner/implementer can build on partial work; if the user prefers a clean slate they can reply "redo clean" → `git checkout -- . && git clean -fd` after explicit confirmation.
+- `RETRY` → re-enter the failed state (useful for transient network/build issues).
+- `ABORT` → `CLOSED` without report; secrets wiped.
+
+This satisfies "if anything fails you have to redo the steps from planning" while leaving the user in control.
+
+---
+
+# 6. Chat participant implementation details
+
+## 6.1 Handler (`participant.ts`)
+
+```ts
+const handler: vscode.ChatRequestHandler = async (request, chatContext, stream, token) => {
+  const engine = getEngine();
+  if (request.command === 'status') return engine.renderStatus(stream);
+  if (request.command === 'abort')  return engine.abort(stream);
+  if (request.command === 'logs')   { output.show(); return; }
+  if (request.command === 'start')  engine.reset();
+  await engine.handleTurn(request, stream, token);
+  return { metadata: { state: engine.currentState } };
+};
+const participant = vscode.chat.createChatParticipant('jira-dev.agent', handler);
+participant.iconPath = vscode.Uri.joinPath(ctx.extensionUri, 'resources/icon.png');
+participant.followupProvider = { provideFollowups: (result) => followupsFor(result.metadata.state) };
+```
+
+`followupsFor` returns clickable suggestions per state (e.g. in `AWAIT_PLAN_APPROVAL`: "approve", "changes: add unit tests for X").
+
+## 6.2 Rendering helpers (`render.ts`)
+
+- `table(rows)` – markdown tables for confirmations.
+- `codeBlock(lang, text, maxLines)` – log excerpts, truncated with "… N more lines in <link>".
+- `fileList(paths)` – `stream.filetree` anchored at repo.
+- `buttons([...])` – wraps `stream.button`.
+- `anchor(uri)` – `stream.anchor` for opening files/logs.
+
+## 6.3 Long-running stage feedback
+
+Automated stages may take minutes. Use `stream.progress('…')` liberally and honour `token.isCancellationRequested` (the user can hit stop in the chat UI). On cancellation: kill child processes, persist state, render "Cancelled at <stage>. Send any message to resume or /redo."
+
+---
+
+# 7. Logging, redaction, and observability
+
+- Single `OutputChannel` "Jira Dev Agent" with timestamped lines `[HH:mm:ss] [STAGE] message`.
+- Every spawned command logs: cwd, command, env overrides (names only), exit code, duration.
+- Per-session log directory `.jira-dev/logs/` with `agent.log`, `git.log`, `build-<n>.log`, `run.log`, `browser.log`.
+- **Redactor**: before any text reaches a log, chat, or report, replace occurrences of every live secret value with `****`. Also mask `Authorization: .*`, `password=.*`, `secret=.*` patterns.
+- Telemetry: none by default.
+
+---
+
+# 8. Security considerations
+
+1. Secrets only in `context.secrets` (OS keychain), scoped by session id, deleted on `CLOSED`/abort.
+2. Never send secrets to the LLM; the implementer/planner contexts exclude `application-*.yml` values matching secret-like keys (mask values, keep keys).
+3. `run_command` tool is whitelisted; no arbitrary shell from the model.
+4. File writes confined to repo toplevel; `.git/` is read-only.
+5. Destructive git operations (`reset --hard`, `clean`, discard dirty tree) require either the configured policy or an explicit "yes" reply, and always log the pre-operation `HEAD` sha and a `git stash` safety net where possible.
+6. Playwright runs with a fresh, non-persistent browser context; no cookies retained after session close.
+
+---
+
+# 9. Prompt files (`resources/prompts/`)
+
+- `planner.md`: role, constraints, JSON schema, instruction to map steps to AC, to include tests, and to consume `failures[]` when present.
+- `implementer.md`: role, tool descriptions, rules ("read before you write", "prefer minimal diffs", "match existing code style", "run the relevant unit test with `run_command` after editing a test", "call `mark_step_done` per plan step", "call `finish` when all steps done").
+- `buildFixer.md`: role, receives error excerpt and file contents; rules ("fix only the reported errors", "do not change behaviour beyond the plan").
+
+Keep prompts as files so they can be tuned without recompiling; load with `fs.readFile` at activation.
+
+---
+
+# 10. Testing strategy for the extension itself
+
+**Unit (mocha + sinon, run with `npm test`):**
+- `intents.ts`: table-driven tests for every intent.
+- `engine.ts`: transition table coverage; failure from each automated state lands in `FAILED_AWAIT_REDO`; redo increments `attempt` and lands in `ANALYZE_AND_PLAN`; persistence round-trip through a fake `Memento`.
+- `buildToolDetector.ts`: fixtures for maven/gradle/npm/none; port detection from yml/properties.
+- `git.ts`: against a temporary real git repo created in `os.tmpdir()` with a bare "origin" — verify fetch/checkout/reset --hard/branch creation/push.
+- Build error extractors: maven and gradle log fixtures.
+- Redactor.
+
+**Integration (`@vscode/test-electron`):**
+- Launch VS Code with the extension and a fixture Spring Boot repo (tiny app with `/actuator/health`), mock `LlmClient` returning canned plan and tool calls; drive the participant through all states to `CLOSED`; assert files, commits, report existence.
+- Playwright stage tested against a bundled fake test-runner (small Express app with login/client/API/run/download pages) using the default profile.
+
+**Manual acceptance checklist:** reload during `SWITCHING_WORKSPACE` and resume; cancel mid-build; dirty tree with each policy; wrong password (login fails → manual fallback); regression fail → redo path.
+
+---
+
+# 11. Build and packaging
+
+- `npm run compile` → esbuild bundle (`--external:vscode --external:playwright` – Playwright is required at runtime from `node_modules`, so the VSIX ships `node_modules/playwright` and downloads Chromium on first use).
+- `vsce package` → `.vsix`; install via "Extensions: Install from VSIX".
+- Minimum VS Code 1.93 (Chat Participant + LM API stable).
+
+---
+
+# 12. Delivery milestones (ordered by dependency, not time)
+
+1. **Skeleton and FSM core** – `package.json`, participant registration, `WorkflowEngine`, `Session` schema, persistence, `/status`, `/abort`, intent parser, unit tests for transitions. Deliverable: `@jira-dev hi` walks through prompts with no-op automated stages.
+2. **Inputs and git** – Jira collection (labelled + LLM fallback), repo selection and validation, build-tool/port detection, workspace switching with resume, git strategy collection, `GIT_PREPARE` with dirty-tree policies. Deliverable: correct branch cut from a force-synced base.
+3. **Planner** – indexer, context builder, planner prompt, plan schema validation, rendering, approval/reject/regenerate loop, redo-with-failure-context.
+4. **Implementer and build** – tool set, agentic loop, guardrails, diff rendering; build runner, error extraction, fix loop.
+5. **Run, health, push** – process runner with log scanning, actuator polling, teardown; commit and push with confirmation and retry.
+6. **Human checkpoints** – dev deploy wait, test-runner URL, secure credential capture.
+7. **Browser automation** – profile schema and loader, Playwright login/client/regression/download with screenshots and manual-fallback, profile recording command, fake test-runner for tests.
+8. **Reporting and close-out** – markdown/docx generators, optional report commit, log validation, session close and secret wipe.
+9. **Hardening** – redaction, cancellation everywhere, integration test suite, README with setup (Copilot requirement, Playwright install, profile authoring guide).
+
+---
+
+# 13. Risks and mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Workspace switch reloads extension host and loses chat context | Persist state before switching; resume notification opens chat with `/resume` |
+| Codebase too large for LLM context | Repo map + keyword-scored file selection with token budget; planner can request more files via a `read_file` tool in a second pass |
+| Implementer makes unbounded or unsafe edits | Iteration cap, path confinement, whitelisted commands, undoable `WorkspaceEdit`, diff review before push |
+| Build never green | Bounded fix loop, then hand back to user with exact errors and redo option |
+| Unknown test-runner UI | Selector profiles, codegen recorder, manual-fallback with browser kept open |
+| Secrets leaking to chat history or logs | SecretStorage, secure input boxes, global redactor, secret wipe on close |
+| Force-pull destroys local work | Dirty-tree policy defaults to abort; stash safety net; pre-op SHA logged |
+
+---
+
+# 14. What the first conversation will look like
+
+```
+You:      @jira-dev hi
+Agent:    Hi. I'll take this Jira ticket end to end. First, the ticket details… (fields)
+You:      Key: PAY-421  Description: Add idempotency key header support to POST /payments …  AC: 1) … 2) …
+Agent:    (table) Correct?
+You:      yes
+Agent:    Which local repository should I work in? [Browse…]
+You:      /Users/me/work/payments-service
+Agent:    Found Maven project, Spring Boot, port 8081 from application-dev.yml. Switching workspace…  (reload)
+Agent:    (notification) Workspace switched — Resume
+You:      @jira-dev /resume
+Agent:    Git strategy. Base: develop? Branch: feature/PAY-421-idempotency-key? Commit: "PAY-421: add idempotency key support"?
+You:      use suggestions
+Agent:    fetch ✓  checkout develop ✓  reset --hard origin/develop ✓  checkout -b feature/PAY-421-idempotency-key ✓
+          Analyzing 342 files… Plan v1: (overview, 6 steps, tests, risks) Do you approve? [Approve] [Request changes]
+You:      approve
+Agent:    Implementing… 6/6 steps. 9 files changed (tree). Building: mvn -B clean install … ✓ 4m12s
+          Starting app (profile dev)… GET http://localhost:8081/actuator/health → 200 {"status":"UP"} ✓  App stopped.
+          Push 9 files to origin/feature/PAY-421-idempotency-key? [Push]
+You:      push
+Agent:    Pushed 3f9a1c2. Please deploy to dev and reply "done". [Deployed]
+You:      done
+Agent:    Start the test runner locally and send me its URL.
+You:      http://localhost:3000
+Agent:    [Enter kID & password] → [Enter clientId & secret]
+Agent:    Opening browser… logged in ✓  client connected ✓  API → Run Regression… completed (148/146/2). Downloaded results (paths).
+          Did the regression pass? [Pass] [Fail — redo from planning]
+You:      pass
+Agent:    Markdown, Word, or both? [Markdown] [Word] [Both]
+You:      both
+Agent:    Written docs/PAY-421-implementation-report.md and .docx. Commit report? …
+          Please validate the logs [Open agent log] … Reply "validated" to close.
+You:      validated
+Agent:    Session closed. Secrets cleared. Summary: …
+```
+
+---
+
+If you want, the natural next step is to scaffold this extension (steps 1–2 of the milestones) in an actual repository; that would need to be started from a surface with repository access so the code can be committed and pushed.
