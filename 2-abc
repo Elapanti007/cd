@@ -1,0 +1,505 @@
+# Revised Implementation Plan — Jira-to-Regression VS Code Agent (v2)
+
+This plan supersedes the first one. Every correction from my re-verification is baked in rather than bolted on: the repository is never swapped out from under the chat session, Git is never allowed to destroy work implicitly, execution commands come from a committed per-repo config instead of guesswork, credentials never touch the chat or the model, browser automation is per-runner and fails into a manual handoff, the report is not pushed onto a verified commit, and failures are classified rather than always rewinding to planning.
+
+Verified against the current API surface: `vscode.chat.createChatParticipant`, `ChatRequest.model` (the user's selected model), `ChatResponseStream.markdown/progress/button/anchor/filetree`, `ChatParticipant.followupProvider`, `lm.registerTool`/`lm.invokeTool`, `ExtensionContext.secrets`, `workspace.updateWorkspaceFolders`. Sources: [Chat Participant API](https://code.visualstudio.com/api/extension-guides/ai/chat), [Language Model API](https://code.visualstudio.com/api/extension-guides/ai/language-model), [VS Code API reference](https://code.visualstudio.com/api/references/vscode-api).
+
+---
+
+## 1. Product shape
+
+One chat participant, `@jira-flow`, that runs a **persisted, resumable, deterministic state machine** with named human checkpoints. The agent orchestrates the steps itself (this is why a participant, not a tool, is the entry point — participants own the orchestration, tools are invoked by someone else's orchestrator).
+
+Two hard invariants that drive most of the design:
+
+1. **The session outlives any single chat turn.** The user will be away for minutes or hours at the deploy and test-runner checkpoints. State lives on disk; every turn re-reads it.
+2. **The agent's working directory is a variable, not the workspace.** All Git, build, run, and file operations take an explicit `cwd`. The VS Code window is never reloaded as part of the happy path, so the chat session is never lost.
+
+### 1.1 Flow (revised)
+
+```
+@jira-flow hi
+ ├─ S1  COLLECT_TICKET          ask Jira key / description / acceptance criteria
+ ├─ S2  COLLECT_REPO            ask absolute repo path → validate → set session.cwd
+ ├─ S3  LOAD_EXEC_CONFIG        read .vscode/jira-flow.yml, or generate+confirm one
+ ├─ S4  COLLECT_GIT_STRATEGY    base branch, feature branch, commit message
+ ├─ S5  PRECHECK_WORKTREE       dirty tree → abort / stash / (explicit) discard
+ ├─ S6  SYNC_AND_BRANCH         fetch → switch base → reset --hard → switch -c feature
+ ├─ S7  ANALYZE                 index whole repo, deep-read relevant files
+ ├─ S8  PLAN                    AC-traceable plan, rendered + written to disk
+ ├─ S9  AWAIT_PLAN_APPROVAL     ⏸ human: approve / request changes
+ ├─ S10 IMPLEMENT               bounded tool-calling edit loop
+ ├─ S11 REVIEW_DIFF             ⏸ human (configurable): show diff, accept / revise
+ ├─ S12 BUILD                   configured clean build + tests, bounded fix loop
+ ├─ S13 RUN_AND_VERIFY          start app w/ configured dev env → configured health URL → stop
+ ├─ S14 COMMIT_AND_PUSH         commit + push feature branch
+ ├─ S15 AWAIT_DEV_DEPLOY        ⏸ human: deploy to dev, reply done
+ ├─ S16 AWAIT_RUNNER_URL        ⏸ human: start test runner locally, send URL
+ ├─ S17 COLLECT_CREDENTIALS     ⏸ human: secure inputs (kID/password, clientId/secret)
+ ├─ S18 REGRESSION              profile-driven Playwright run, manual-handoff on miss
+ ├─ S19 COLLECT_RESULTS         download + parse + screenshot
+ ├─ S20 AWAIT_TEST_VERDICT      ⏸ human: pass / fail
+ ├─ S21 REPORT                  ask format → write md/docx as artifact (not auto-pushed)
+ ├─ S22 AWAIT_LOG_VALIDATION    ⏸ human: validate logs
+ └─ S23 CLOSE                   wipe secrets, archive session
+
+ Any error → S_TRIAGE (classify) → retry / re-ask / fix-loop / replan / pause
+```
+
+`⏸` marks the eleven points where the machine stops and waits. Everything else runs to completion and auto-advances within the same turn.
+
+---
+
+## 2. Architecture
+
+### 2.1 Layers
+
+| Layer | Responsibility | Never does |
+|---|---|---|
+| `chat/` | Participant handler, intent parsing, rendering, followups | Business logic, process spawning |
+| `workflow/` | State machine, persistence, resume, failure triage | Direct I/O |
+| `stages/` | One file per state: `onEnter`, `onUserMessage` | Own its own persistence |
+| `services/` | git, exec, config, index, llm, browser, secrets, report | Know about chat |
+| `util/` | logger, redactor, tokens, retry, paths | — |
+
+The stage layer is the only place that knows the order of operations; services are all independently testable with a temp repo and no VS Code host.
+
+### 2.2 Repository layout
+
+```
+jira-flow-agent/
+├─ package.json
+├─ src/
+│  ├─ extension.ts
+│  ├─ chat/{participant.ts,intents.ts,render.ts,followups.ts,commands.ts}
+│  ├─ workflow/{engine.ts,session.ts,states.ts,triage.ts,store.ts}
+│  ├─ stages/s01..s23 + sTriage.ts
+│  ├─ services/
+│  │  ├─ git.ts
+│  │  ├─ exec.ts            # spawn w/ cwd, env, streaming, tree-kill, redaction
+│  │  ├─ execConfig.ts      # .vscode/jira-flow.yml load/generate/validate
+│  │  ├─ index/{walker.ts,repoMap.ts,search.ts,selector.ts}
+│  │  ├─ llm.ts             # wraps request.model; tool-call loop driver
+│  │  ├─ edit/{tools.ts,guard.ts,patch.ts}
+│  │  ├─ health.ts
+│  │  ├─ browser/{runner.ts,profile.ts,handoff.ts}
+│  │  ├─ report/{markdown.ts,docx.ts,collect.ts}
+│  │  └─ secrets.ts
+│  └─ util/{logger.ts,redact.ts,retry.ts,paths.ts,tokens.ts}
+├─ resources/prompts/{planner.md,implementer.md,fixer.md,extract.md}
+├─ resources/profiles/example-runner.json
+└─ test/{unit,integration,fixtures/{maven-app,fake-runner}}
+```
+
+### 2.3 Model access
+
+Use `request.model` — the model the user picked in the chat dropdown. Only fall back to `lm.selectChatModels({ vendor: 'copilot' })` when a background stage needs a model outside a live request (there are none in this design; all stages run inside a turn). No hardcoded model family. No `extensionDependencies` on Copilot unless the extension has no non-chat surface.
+
+```ts
+const llm = new Llm(request.model, { redact, logger, token });
+const plan = await llm.json(PlanSchema, plannerPrompt, contextMessages);
+```
+
+`Llm` provides three primitives: `text()`, `json(schema, ...)` with one reprompt on schema failure, and `toolLoop({ tools, maxIterations, onProgress })`.
+
+### 2.4 Persistence and resume
+
+```ts
+// store.ts
+// Primary:   <repo>/.jira-flow/session.json      (portable, survives window changes)
+// Index:     globalState['jiraFlow.activeSessions'] = [{ id, repoPath, state, updatedAt }]
+```
+
+- Written **before and after** every automated stage, so a crash lands on a known state.
+- `.jira-flow/` is added to `.git/info/exclude`, never to the repo's `.gitignore`.
+- On activation, if an active non-terminal session exists, show a status-bar item `$(rocket) jira-flow: S12 BUILD` and one notification with a **Resume** button that runs `workbench.action.chat.open` with `query: '@jira-flow /resume'`. No auto-injected assistant turns.
+
+---
+
+## 3. Session model
+
+```ts
+export interface Session {
+  id: string; createdAt: string; updatedAt: string;
+  state: State; enteredStateAt: string;
+  planRevision: number; replanCount: number;
+
+  ticket?: { key: string; summary?: string; description: string; acceptanceCriteria: string[] };
+
+  repo?: {                       // cwd for ALL operations
+    path: string; toplevel: string; remote?: string; defaultBranch?: string;
+    addedAsWorkspaceFolder: boolean;
+  };
+
+  exec?: ExecConfig;             // §5, from .vscode/jira-flow.yml (user-confirmed)
+
+  git?: { baseBranch: string; featureBranch: string; commitMessage: string;
+          baseSha?: string; headShaAtStart?: string; stashRef?: string; pushedSha?: string };
+
+  plan?: { revision: number; structured: Plan; markdown: string;
+           approvedAt?: string; feedback: string[] };
+
+  impl?: { filesChanged: string[]; iterations: number; summary: string; diffStat: string };
+
+  build?: { command: string; attempts: number; ok: boolean; durationMs: number; logPath: string };
+
+  verify?: { healthUrl: string; httpStatus: number; body: string; at: string; appLogPath: string };
+
+  deploy?: { confirmedAt: string; note?: string };
+
+  regression?: { runnerUrl: string; profile: string; startedAt: string; finishedAt?: string;
+                 resultFiles: string[]; screenshots: string[];
+                 summary?: { total: number; passed: number; failed: number; skipped: number };
+                 manualSteps: string[]; verdict?: 'pass' | 'fail' };
+
+  report?: { format: 'md' | 'docx' | 'both'; paths: string[]; committed: boolean };
+
+  incidents: Incident[];         // §9
+  secretRefs: string[];          // KEYS ONLY — e.g. "jiraFlow.<id>.kidPassword"
+}
+```
+
+Validated with `zod` on every read. Schema version field + migration switch so an in-flight session survives an extension update.
+
+**No secret value is ever a field in this object.**
+
+---
+
+## 4. Repository targeting without reloading the window (correction 2)
+
+`s02_collectRepo.ts`:
+
+1. Accept an absolute path typed in chat, or a **Browse…** button → `showOpenDialog({ canSelectFolders: true })`.
+2. Validate: exists, is a directory, `git -C <p> rev-parse --show-toplevel` succeeds. Normalize `repo.path` to the toplevel and say so if it differed.
+3. Read `git remote get-url origin` (absent remote is recorded now and surfaced as a hard blocker before S14, not at push time).
+4. **Do not call `vscode.openFolder`.** Instead:
+   - If the path is already a workspace folder → nothing to do.
+   - Else offer, non-blocking: `[Add to workspace]` → `workspace.updateWorkspaceFolders(count, 0, { uri })` (additive; does not reload a saved/multi-root workspace) and `[Work without adding]`.
+   - Only if the user explicitly asks to *replace* the window do we call `vscode.openFolder`, and then we persist `state` first and rely on the Resume notification.
+5. Every downstream call receives `cwd: session.repo.path`. `paths.ts` exposes `assertInsideRepo(p)` used by every write.
+
+This removes the extension-host reload from the critical path entirely, which was the single largest fragility in v1.
+
+---
+
+## 5. Per-repo execution config (correction 6)
+
+Guessing Maven vs Gradle, the Spring profile, the port, and the health path is a convenience, not a contract. The contract is a committed file.
+
+`.vscode/jira-flow.yml`:
+
+```yaml
+version: 1
+
+build:
+  clean: "./mvnw -B clean verify"          # must fail the process on test failure
+  timeoutSeconds: 1800
+  env:
+    MAVEN_OPTS: "-Xmx2g"
+
+run:
+  command: "./mvnw -B spring-boot:run"
+  env:
+    SPRING_PROFILES_ACTIVE: dev
+  readyTimeoutSeconds: 240
+  failFastLogPatterns:
+    - "APPLICATION FAILED TO START"
+    - "Port .* was already in use"
+
+health:
+  url: "http://localhost:8080/actuator/health"
+  expectStatus: 200
+  expectJsonPath: "$.status"
+  expectValue: "UP"
+
+regression:
+  profile: "payments-runner"               # resources/profiles or .jira-flow/profiles
+
+report:
+  outputDir: ".jira-flow/artifacts"
+  commitToBranch: false                    # see correction 9
+```
+
+`s03_loadExecConfig.ts` behaviour:
+
+- File present and valid → render it, ask `[Use this] [Edit first]`.
+- Absent → **detect and propose**: build tool from `pom.xml`/`build.gradle*`/lockfiles; port from `application-dev.{yml,yaml,properties}` then `application.*`, honoring `server.port`, `management.server.port`, `management.endpoints.web.base-path`; health path defaulting to `/actuator/health` **only if an actuator dependency is already present**. Write the proposal to the file and require `[Confirm]` before use.
+- If no health endpoint exists, the agent says so and offers alternatives (`[Use a different URL] [Verify by log line instead] [Skip runtime verification]`). It **never** adds `spring-boot-starter-actuator` or exposes endpoints just to make its own check pass. That would be the agent modifying the app's security surface to satisfy itself.
+- `build.clean` must be a command that fails on test failure; if the detected command is `mvn clean install -DskipTests`, the agent flags it.
+
+---
+
+## 6. Git: safe by construction (correction 1)
+
+### 6.1 `s05_precheckWorktree.ts`
+
+```bash
+git -C <cwd> rev-parse --abbrev-ref HEAD        # recorded
+git -C <cwd> rev-parse HEAD                     # headShaAtStart, always logged
+git -C <cwd> status --porcelain --untracked-files=all
+```
+
+If output is non-empty, the machine **stops and asks**, showing the file list:
+
+- `[Stash]` → `git stash push --include-untracked -m "jira-flow/<key>/<iso>"`; store `stashRef`; report it in the final summary and on abort.
+- `[Abort]` (default) → stay in S5, tell the user to handle it.
+- `[Discard]` → requires the user to type the exact phrase `discard my changes`; only then `git reset --hard && git clean -fd`. Never triggered by a bare "yes".
+
+Also verified here: no in-progress rebase/merge/cherry-pick (`.git/REBASE_HEAD`, `MERGE_HEAD`), no detached HEAD surprise, and `git rev-parse --is-shallow-repository` (shallow clones break `reset --hard origin/<base>` history assumptions — warn).
+
+### 6.2 `s06_syncAndBranch.ts`
+
+```bash
+git -C <cwd> fetch origin --prune --tags
+git -C <cwd> rev-parse --verify origin/<base>        # else: list candidates, back to S4
+git -C <cwd> switch <base>                           # or: switch -c <base> --track origin/<base>
+git -C <cwd> reset --hard origin/<base>              # "force pull", explicit and scoped
+git -C <cwd> rev-parse HEAD                          # baseSha
+git -C <cwd> check-ref-format --branch <feature>
+git -C <cwd> switch -c <feature>                     # if exists: [Reuse] [Rename] [Delete & recreate]
+```
+
+Notes on what changed from v1:
+
+- No bare `git pull` on an arbitrary current branch. The first network op is `fetch`, which mutates no working tree.
+- `reset --hard` is applied **only after** `switch <base>` succeeded and only against `origin/<base>`, and only after S5 cleared or stashed the tree.
+- `switch` instead of `checkout` throughout — it refuses ambiguous path/branch arguments.
+- Rerun-safe: if the feature branch already exists at `baseSha`, S6 is a no-op, so triage can re-enter it freely.
+
+### 6.3 `services/git.ts`
+
+Thin wrapper over the `git` binary via `exec.ts`, not a library that hides raw commands. Every call logs `cwd`, argv, exit code, duration, and the first/last 40 lines of output. Two helper predicates used by triage: `isTransientGitError(stderr)` (DNS, connection reset, 5xx, `could not read Username` → auth, which is *not* transient) and `isConflictError(stderr)`.
+
+---
+
+## 7. Analysis and planning (correction 5)
+
+"Go through the entire code" is implemented as **complete structural coverage plus targeted deep reads**, because no model gets an unbounded repo in one prompt. Concretely, S7 does:
+
+1. **Enumerate everything tracked**: `git ls-files` + `git ls-files --others --exclude-standard`. Skip binaries, >512 KB, and build output. This is the full inventory — nothing is silently outside the agent's view.
+2. **Repo map**: for each file, path, language, LOC, and a one-line signature summary. For JVM files a regex pass extracts package, type name, key annotations (`@RestController`, `@Service`, `@Repository`, `@Entity`, `@Configuration`, `@ConfigurationProperties`), and public method signatures. For TS/JS, exported symbols. Cached at `.jira-flow/index.json` keyed by `HEAD` + dirty-hash.
+3. **Structural summary**: modules/build files, test layout and framework, HTTP surface (controller → path map), persistence/migrations, config keys per profile, dependency list.
+4. **Retrieval**: extract 10–25 identifiers/domain terms/endpoint paths from the ticket via a small `extract.md` LLM call, then `ripgrep` each; score files by weighted hits; always pin build files, `application*.{yml,properties}`, the main class, and migration directory listings.
+5. **Deep read** top-scored files in full, to a token budget (default 60k, configurable), with the repo map covering the remainder.
+6. **Planner may ask for more**: S7/S8 run as a tool loop with read-only tools (`list_dir`, `read_file`, `search`) so the model can pull in files retrieval missed, up to 15 iterations.
+
+`s08_plan.ts` emits a schema-validated plan whose central property is **AC traceability**:
+
+```ts
+const Plan = z.object({
+  overview: z.string(),
+  assumptions: z.array(z.string()),
+  openQuestions: z.array(z.string()),
+  steps: z.array(z.object({
+    id: z.number(), title: z.string(), rationale: z.string(),
+    files: z.array(z.object({ path: z.string(), action: z.enum(['create','modify','delete']) })),
+    acceptanceCriteria: z.array(z.number()).min(1),   // every step earns its place
+    risk: z.enum(['low','medium','high']), riskNote: z.string(),
+    tests: z.array(z.string()),                        // required for behavioural steps
+  })),
+  verification: z.array(z.string()),
+  rollback: z.string(),
+});
+```
+
+Post-validation in code, not in the prompt: every `modify`/`delete` path exists in the index; **every acceptance criterion is referenced by ≥1 step** (unreferenced AC → one automatic reprompt listing the gaps, then surfaced to the user as a coverage warning); no step touches `.git/` or paths outside the repo.
+
+Rendered to chat as overview + step table (id, title, files, AC refs, risk) + testing + assumptions + open questions, and written to `.jira-flow/artifacts/plan-r<N>.md`.
+
+`s09_awaitPlanApproval.ts`: `[Approve] [Request changes] [Open plan]`. Open questions block approval by default (`requireAnswers: true`); answers are appended to the ticket context as "Clarifications" and the plan is regenerated at `revision+1`. Rejection text lands in `plan.feedback` and feeds the next planner prompt.
+
+---
+
+## 8. Implementation, build, and runtime verification
+
+### 8.1 `s10_implement.ts` — bounded tool loop
+
+Tools registered for the loop (also exposed via `lm.registerTool` so Copilot Agent Mode can reuse them): `list_dir`, `read_file`, `search`, `write_file`, `apply_patch`, `run_command`, `mark_step_done`, `finish`.
+
+Guards in `edit/guard.ts`, enforced in code before every call:
+
+- Writes resolve inside `repo.toplevel`; reject `..`, symlinks escaping the repo, and anything under `.git/` or `.jira-flow/`.
+- `apply_patch` requires `oldText` to match exactly once, else it errors back to the model (no fuzzy application).
+- All edits go through `vscode.WorkspaceEdit` so the user can undo them.
+- `run_command` is allowlisted to the repo's own tooling (`./mvnw`, `mvn`, `./gradlew`, `gradle`, `npm`, `npx`, `git status|diff|log`) with a 10-minute cap; no arbitrary shell, no network installs.
+- Iteration cap (default 40); cancellation via the chat stop button kills children and persists state.
+
+Completion requires `mark_step_done` for each plan step; a single follow-up prompt chases stragglers before the loop is declared non-convergent.
+
+### 8.2 `s11_reviewDiff.ts` — optional human gate
+
+`git diff --stat` + `stream.filetree(changed, repoUri)` with clickable per-file diffs against `baseSha`. `[Looks good] [Revise: …]`. On by default for `risk: high` steps; configurable to always/never. This is cheap insurance before the agent starts pushing commits.
+
+### 8.3 `s12_build.ts`
+
+Runs `exec.clean` exactly as configured, streaming into an `OutputChannel` and a `Pseudoterminal` tab, tee'd to `.jira-flow/logs/build-<n>.log`. On non-zero exit, an error extractor produces a compact diagnosis:
+
+| Tool | Extraction |
+|---|---|
+| Maven | `[ERROR]` lines, `COMPILATION ERROR` block, Surefire/Failsafe `Tests run: … Failures: n`, failing test FQNs |
+| Gradle | `> Task … FAILED`, `e: `/`error:` lines, test HTML/XML report parse |
+| npm | tsc `TSxxxx`, eslint, jest failure summary |
+
+Then a bounded fix loop (default 3 attempts): `fixer.md` + extracted errors + the referenced files → same edit tools, ≤10 iterations → rebuild. Attempts exhausted → triage as `IMPLEMENTATION_DEFECT`.
+
+### 8.4 `s13_runAndVerify.ts`
+
+1. Spawn `exec.run.command` with `exec.run.env` (the configured dev env — no invented profile names), detached with a tracked process group.
+2. While waiting, tail the log for `failFastLogPatterns` and abort early with the excerpt. Port-in-use offers `[Show process] [Retry]` — never an unattended kill.
+3. Poll `health.url` until `expectStatus` and, when configured, `expectJsonPath === expectValue`. Timeout from config.
+4. Record `verify` (URL, status, body, timestamp, log path) and render the exact request/response line in chat.
+5. **Always** tear down: `SIGTERM` to the process group, `SIGKILL` after 10 s, verified dead. `keepRunning` is opt-in only.
+
+### 8.5 `s14_commitAndPush.ts`
+
+```bash
+git -C <cwd> add -A
+git -C <cwd> commit -m "<commitMessage>"       # hook failure → triage, full hook output shown
+git -C <cwd> push -u origin <feature>          # retry 4x (4/8/16/32s) on transient only
+git -C <cwd> rev-parse HEAD                    # pushedSha
+```
+
+Pre-push: absent remote is a hard stop with instructions; `confirmBeforePush` (default true) shows the diffstat and `[Push] [Cancel]`. A PR-creation URL in the push output is rendered as a link. Auth failures are classified `CREDENTIALS`, not transient, so they are never retried in a loop.
+
+---
+
+## 9. Failure triage instead of blanket replanning (correction 10)
+
+`s_triage.ts` is entered on every thrown error and every negative human verdict. It classifies, records an `Incident`, and routes:
+
+```ts
+interface Incident { at: string; state: State; class: FailureClass;
+                     message: string; excerpt: string; action: TriageAction; }
+```
+
+| Class | Detection | Route |
+|---|---|---|
+| `TRANSIENT` | DNS/ECONNRESET/5xx/timeout on fetch, push, health poll | Retry same state, exponential backoff, max 4 |
+| `CREDENTIALS` | Git auth prompt, HTTP 401/403, login selector reached but form rejected | Re-ask credentials (secure input), then resume same state |
+| `CONFIG` | Build/run command not found, port mismatch, health 404 | Back to S3 to correct `jira-flow.yml`, then resume |
+| `SELECTOR` | Playwright timeout locating a known element | Manual handoff (§10.3) or profile edit, resume mid-run |
+| `IMPLEMENTATION_DEFECT` | Compile/test failure after fix attempts exhausted | Fix loop first; then S10 with failure context; replan only if it recurs |
+| `DESIGN_DEFECT` | Regression failure tied to an AC, or user says the approach is wrong | Back to S8 `PLAN` with incident context, `replanCount++` |
+| `INFRA_UNAVAILABLE` | Dev env down, runner not reachable | Pause: persist and wait for the user, no state loss |
+| `USER_REJECT` | Plan or diff rejected | Back to S8 with feedback |
+
+Every triage render includes `[Retry] [Fix config] [Replan] [Pause] [Abort]`, so "redo from planning" is always one click away — it is just no longer the automatic response to a flaky network. Replan prompts receive the last incidents, the previous plan, and the current diff so the planner revises rather than restarts blind.
+
+---
+
+## 10. Human checkpoints, credentials, and the browser
+
+### 10.1 Checkpoint mechanics (correction 3)
+
+Buttons execute commands; a command has no access to the original `ChatResponseStream`. So every checkpoint is designed to be satisfied **either** by a typed reply **or** by a button that (a) mutates the persisted session, (b) shows a toast confirming what it recorded, and (c) invokes `workbench.action.chat.open` with a prefilled `@jira-flow /continue`. No stage ever assumes a command callback can emit an assistant turn.
+
+Deterministic intent parsing runs before any LLM call, so `approve`, `done`, `pass`, `fail`, `redo`, `/abort`, URLs, and format choices are never model-interpreted. Prose for structured fields (ticket details, Git strategy) falls back to a schema-constrained extraction call, then a confirmation table.
+
+### 10.2 Credentials (correction 7)
+
+`s17_collectCredentials.ts` never accepts secrets from the chat prompt.
+
+```
+I need test-runner credentials. These are entered in VS Code's secure input,
+stored in the OS keychain for this session, and deleted when the session closes.
+[Enter kID & password]   [Enter clientId & secret]
+```
+
+Each button: `showInputBox({ prompt, password: true, ignoreFocusOut: true })` → `context.secrets.store('jiraFlow.<sessionId>.<name>', value)` → session records only the key name.
+
+Rules enforced in code:
+
+- Secrets are read from `secrets` immediately before use and held in a local for the duration of one `fill()`.
+- `util/redact.ts` masks every live secret value (plus `Authorization:`, `password=`, `secret=`, `token=` patterns) in **all** sinks: output channel, log files, chat, report, exception messages.
+- Secrets are never placed in an LLM message. The context builder masks values of secret-shaped config keys while keeping the keys visible.
+- Screenshots are taken **after** an explicit `page.fill` of password fields only when the field is masked by the app; otherwise the screenshot step is skipped for that view.
+- `s23_close` and abort both delete every key in `secretRefs` and verify deletion.
+- MFA/SSO/CAPTCHA/hardware token: detected as a `SELECTOR`/`CREDENTIALS` class and routed to manual handoff — the agent cannot and should not automate a second factor.
+- The prompt text recommends dedicated short-lived test credentials, not personal ones.
+
+### 10.3 Regression (correction 8)
+
+No universal profile. One profile per test-runner application, versioned in the repo at `.jira-flow/profiles/<name>.json` and referenced by `exec.regression.profile`:
+
+```json
+{
+  "name": "payments-runner", "version": 1,
+  "login":       { "path": "/login", "user": "#kid", "password": "input[type=password]",
+                   "submit": "button[type=submit]", "success": "[data-testid=dashboard]", "timeoutSeconds": 60 },
+  "clientAuth":  { "path": "/settings/client", "clientId": "#clientId", "clientSecret": "#clientSecret",
+                   "submit": "button:has-text('Connect')", "success": "text=Connected" },
+  "api":         { "nav": "a:has-text('API')", "path": "/api", "ready": "[data-testid=api-suite]" },
+  "regression":  { "start": "button:has-text('Run Regression')", "running": "[data-testid=running]",
+                   "complete": "[data-testid=run-complete]", "timeoutSeconds": 3600,
+                   "summary": { "total": "[data-testid=total]", "passed": "[data-testid=passed]", "failed": "[data-testid=failed]" } },
+  "download":    { "trigger": "button:has-text('Download results')", "extensions": [".xlsx", ".csv", ".json", ".zip"] }
+}
+```
+
+- `jiraFlow.recordProfile` command launches `npx playwright codegen <url>` and writes a scaffold from what the user captures.
+- **Profile validation gate**: a profile must pass a `jiraFlow.validateProfile` dry run (login + navigate + locate start button, no run) against a staging runner before it is allowed to drive an autonomous regression. Unvalidated profile → the agent runs in step-confirm mode instead.
+- Run: headed Chromium, fresh non-persistent context, `acceptDownloads: true`, per-step `stream.progress`, screenshot per step.
+- **Manual handoff on any miss**: on selector timeout the agent saves a screenshot + DOM excerpt, leaves the browser open, and asks `[I did this step — continue] [Update profile & retry] [Fail]`. Manual steps are recorded in `regression.manualSteps` and appear in the report, so the audit trail distinguishes automated from human actions.
+- `s19_collectResults.ts`: `waitForEvent('download')` paired with the trigger click, `saveAs` under `exec.report.outputDir`, unzip if needed, tolerant parse of total/passed/failed/skipped (file first, on-page selectors second, unknown third), final full-page screenshot, browser closed unless failures exist.
+- `s20_awaitTestVerdict.ts`: the parsed counts are shown, but **the user decides** pass/fail (flakes are real). `fail` → triage as `DESIGN_DEFECT` with the failing test names attached.
+
+---
+
+## 11. Reporting without poisoning the verified commit (correction 9)
+
+The report is produced after deploy and regression, so committing it to the feature branch would put an untested commit on top of the SHA that was actually verified. Default behaviour therefore:
+
+- Write artifacts to `exec.report.outputDir` (git-excluded): `<KEY>-report.md` and/or `.docx`, plus results files and screenshots.
+- `commitToBranch: false` by default. Offer `[Save as artifact] [Attach to Jira] [Commit as docs-only commit]`; the third option commits with message `docs(<KEY>): implementation report [no functional change]` and the report itself states that this commit was added **after** verification and contains no source changes.
+- If documentation is a deliverable of the ticket, the plan must include it as a step, the doc is written during S10, and it is covered by the same build/verify/push cycle — no post-hoc exception.
+
+Report contents (all redacted): ticket + AC with per-AC step mapping and coverage warnings; repo/remote/base SHA/feature branch/pushed SHA/PR link; final plan + revision history and rejection feedback; files changed with `git diff --stat baseSha..pushedSha`; build command, attempts, duration, log link, fix-loop summary; runtime verification (exact URL, status, body, timestamp); deploy confirmation and note; regression (runner URL, profile + version, validated or step-confirm, counts, result file paths, embedded screenshots, **manual steps performed by the human**); full incident log with classifications and actions; appendix of every command with cwd, exit code, duration.
+
+`s22_awaitLogValidation.ts` gives `[Agent log] [Build log] [App log] [Artifacts folder]` and accepts `validated` or `issue: …`. `s23_close.ts` wipes secrets, reports any outstanding `stashRef`, archives the session to `.jira-flow/sessions/<id>.json`, clears the active index, and prints the final summary.
+
+---
+
+## 12. Testing the extension
+
+**Unit (mocha + sinon, no VS Code host):** intent parser table tests; engine transition matrix incl. every triage class routing to the right state; session schema round-trip and migration; `execConfig` detection and validation (including rejecting `-DskipTests` as a clean-build command); Maven/Gradle/npm error extractors against log fixtures; redactor (multi-secret, overlapping, partial-line, exception message); `paths.assertInsideRepo` against `..`, absolute, and symlink escapes.
+
+**Git integration (temp dirs, real `git`, bare origin):** dirty-tree abort/stash/discard-with-phrase; base sync + branch cut; existing-branch reuse/rename; shallow-clone warning; conflict and auth error classification; push retry only on transient.
+
+**Extension integration (`@vscode/test-electron`, fixture Maven app with a real `/actuator/health`):** stub `LanguageModelChat` returning canned plan + tool calls; drive S1→S23 and assert branch, files, commit, verified health, artifacts, secrets deleted. Resume test: kill the host at S12 and re-activate.
+
+**Regression stage (fixture `fake-runner` Express app):** happy path; selector miss → manual handoff → continue; download parse for `.json`/`.csv`/`.zip`; failed-counts path → `DESIGN_DEFECT` → replan.
+
+**Manual acceptance:** cancel mid-build; wrong password; runner requiring MFA; no remote configured; no actuator present; `git reset` refused on dirty tree.
+
+---
+
+## 13. Build order
+
+1. **Core**: manifest + participant + engine + session store + intents + `/status`, `/resume`, `/abort` + transition unit tests. Walkthrough: `hi` traverses all prompts with no-op stages.
+2. **Targeting**: S1–S3 (ticket, repo validation without reload, exec config detect/confirm/write).
+3. **Git safety**: S4–S6 plus `services/git.ts` and its integration suite. This lands before anything that can write code.
+4. **Analyze + plan**: walker, repo map, retrieval, planner tool loop, AC-coverage validation, approval loop.
+5. **Implement + build**: edit tools + guards, bounded loop, diff review gate, build runner + extractors + fix loop.
+6. **Verify + push**: process runner with fail-fast log scan, health assertion, guaranteed teardown, commit/push with confirmation and scoped retry.
+7. **Triage**: classification, incident log, routing, and the pause/resume path. Retro-wire stages 3–6 to it.
+8. **Checkpoints + secrets**: deploy wait, runner URL, secure-input credential capture, redactor wired into every sink.
+9. **Regression**: profile schema, loader, validation gate, Playwright run, manual handoff, download + parse, fake-runner tests.
+10. **Report + close**: collectors, markdown/docx, artifact-first delivery, log validation, secret wipe, session archive.
+11. **Hardening**: cancellation everywhere, schema migration, README (exec-config authoring, profile authoring, credential policy, what the agent refuses to do).
+
+---
+
+## 14. Residual risks
+
+| Risk | Mitigation in this plan |
+|---|---|
+| Force-sync destroys uncommitted work | S5 gate, stash default offer, typed phrase for discard, `headShaAtStart` logged, stash reported at close |
+| Repo too large for one context | Full structural inventory + scored retrieval + planner-requested reads; coverage warnings when AC map is thin |
+| Agent weakens the app to pass its own check | Health config is user-confirmed; agent refuses to add/expose actuator endpoints |
+| Credentials leaking into chat history, logs, or prompts | Secure inputs only, keychain storage, global redactor, secrets excluded from LLM context, wipe on close |
+| Unknown runner UI | Per-runner validated profile, step-confirm mode when unvalidated, manual handoff recorded in the report |
+| Untested commit from the report | Artifact-first; docs-only commit is opt-in and labelled |
+| Transient failures burning full replan cycles | Triage classification; replan reserved for design defects and user rejection |
+| Window reload killing the session | Reload removed from the happy path; session on disk; Resume via notification + prefilled chat |
+
+The core idea holds: a deterministic, persisted state machine driving a chat participant is the right architecture for this workflow. What v2 changes is that the dangerous parts — Git history, workspace identity, execution commands, secrets, browser assumptions, commit ordering, and failure response — are now explicit contracts with human gates rather than inferred behaviour.
